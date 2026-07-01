@@ -1,0 +1,630 @@
+---
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+    latex_engine: xelatex
+    extra_dependencies: ["booktabs", "float", "amsmath", "geometry"]
+    includes:
+      in_header: headerAE.tex
+      before_body: titlepageAE.tex
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: show
+geometry: "margin=2.5cm"
+fontsize: 12pt
+linestretch: 1.5
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{amsmath}
+  - \usepackage{setspace}
+  - \usepackage{fancyhdr}
+  - \usepackage{titling}
+  - \usepackage{abstract}
+
+---
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width  = 6,
+  fig.height = 3.5,
+  out.width  = "90%"
+)
+```
+
+
+---
+
+# Data
+
+## Loading and Preparing the Data
+
+```{r libraries, message=FALSE, warning=FALSE}
+# Uncomment to install if needed:
+# install.packages(c("tidyverse","plm","lmtest","stargazer",
+#                    "ggplot2","car","forecast","tseries","kableExtra","scales"))
+
+library(tidyverse)
+library(plm)
+library(lmtest)
+library(stargazer)
+library(ggplot2)
+library(car)
+library(forecast)
+library(tseries)
+library(zoo)
+library(kableExtra)
+library(scales)
+```
+
+```{r load-data}
+# Load the dataset — make sure the CSV is in your working directory
+data_raw <- read.csv("panel_data_8countries.csv", stringsAsFactors = FALSE)
+
+cat("Dimensions:", nrow(data_raw), "rows x", ncol(data_raw), "columns\n")
+glimpse(data_raw)
+```
+
+```{r process-data}
+# Define country groups
+emerging_importers <- c("Turkey", "Poland", "India",
+                        "Indonesia", "South_Africa", "Thailand")
+advanced_exporters <- c("United_States", "Canada")
+
+# Process data: parse dates, compute log variables, post-crisis dummy
+data_processed <- data_raw %>%
+  mutate(
+    date        = as.Date(date, format = "%d/%m/%Y"),
+    ln_cpi      = log(cpi),
+    ln_ipi      = log(ipi),
+    ln_neer     = log(neer),
+    post_crisis = as.integer(date >= as.Date("2026-03-01")),
+    oil_balance = if_else(country %in% advanced_exporters,
+                          "Exporter", "Importer"),
+    dev_level   = if_else(country %in% advanced_exporters,
+                          "Advanced", "Emerging"),
+    group       = paste(dev_level, oil_balance, sep = "_")
+  )
+
+# Compute oil shock from Brent series (recalculated, not taken from CSV)
+oil_shock_lookup <- data_processed %>%
+  distinct(date, brent) %>%
+  arrange(date) %>%
+  mutate(oil_pct_change = c(0, diff(brent) / head(brent, -1) * 100))
+
+data_processed <- data_processed %>%
+  { if ("oil_pct_change" %in% names(.)) select(., -oil_pct_change) else . } %>%
+  left_join(oil_shock_lookup %>% select(date, oil_pct_change), by = "date")
+
+cat("\nDate range:", as.character(min(data_processed$date)),
+    "to", as.character(max(data_processed$date)))
+cat("\nCountries:", paste(sort(unique(data_processed$country)), collapse = ", "))
+cat("\nTotal observations:", nrow(data_processed), "\n")
+```
+
+## Descriptive Statistics
+
+```{r summary-table}
+data_processed %>%
+  select(ln_cpi, ln_ipi, oil_pct_change,
+         ln_neer, policy_rate, vix, brent) %>%
+  summarise(across(everything(),
+    list(Mean = ~round(mean(.), 3), SD   = ~round(sd(.), 3),
+         Min  = ~round(min(.), 3),  Max  = ~round(max(.), 3)),
+    .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(),
+               names_to  = c("Variable", "Stat"),
+               names_sep = "__") %>%
+  pivot_wider(names_from = Stat, values_from = value) %>%
+  mutate(Variable = case_match(Variable,
+    "ln_cpi"         ~ "ln(CPI)",
+    "ln_ipi"         ~ "ln(IPI)",
+    "oil_pct_change" ~ "Oil Shock (%)",
+    "ln_neer"        ~ "ln(NEER)",
+    "policy_rate"    ~ "Policy Rate (%)",
+    "vix"            ~ "VIX",
+    "brent"          ~ "Brent (USD/bbl)",
+    .default         = Variable
+  )) %>%
+  kbl(caption = "Descriptive Statistics — Full Panel (Jan 2023 – Jun 2026)",
+      digits = 3, align = "lrrrr", booktabs = TRUE) %>%
+  kable_styling(latex_options = c("striped", "hold_position"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  footnote(general = "N = 336 observations. 8 countries × 42 months.",
+           general_title = "Note:")
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Brent Crude Oil Price
+
+```{r plot-oil, fig.cap="Brent Crude Oil Price: Pre- and Post-2026 Gulf Crisis"}
+oil_ts <- data_processed %>% distinct(date, brent) %>% arrange(date)
+
+ggplot(oil_ts, aes(x = date, y = brent)) +
+  geom_area(fill = "#c0392b", alpha = 0.12) +
+  geom_line(color = "#c0392b", linewidth = 1.1) +
+  geom_vline(xintercept = as.numeric(as.Date("2026-02-27")),
+             linetype = "dashed", color = "#2c3e50", linewidth = 0.9) +
+  annotate("label", x = as.numeric(as.Date("2026-02-27")),
+           y = max(oil_ts$brent) * 0.88,
+           label = "Gulf Crisis\nFeb 27, 2026",
+           color = "#2c3e50", size = 3.5, hjust = 1.08,
+           fill = "white", label.size = 0.3) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  scale_y_continuous(labels = dollar_format(prefix = "$")) +
+  labs(title    = "Brent Crude Oil Price: Pre- and Post-2026 Gulf Crisis",
+       subtitle = "Monthly average, USD per barrel",
+       x = NULL, y = "USD / Barrel") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
+```
+
+## Monthly Oil Shock Variable
+
+```{r plot-shock, fig.cap="Monthly Percentage Change in Brent Crude (OilShock variable)"}
+oil_chg <- oil_shock_lookup %>%
+  mutate(direction = ifelse(oil_pct_change >= 0, "Increase", "Decrease"))
+
+ggplot(oil_chg, aes(x = date, y = oil_pct_change, fill = direction)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  geom_vline(xintercept = as.numeric(as.Date("2026-02-27")),
+             linetype = "dashed", color = "#2c3e50") +
+  scale_fill_manual(values = c("Increase" = "#27ae60",
+                               "Decrease" = "#e74c3c"), name = NULL) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(title    = "Monthly % Change in Brent Crude Oil Price",
+       subtitle = "The OilShock variable used in regression; dashed line = Gulf Crisis",
+       x = NULL, y = "% Change") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+## CPI Trends by Country Group
+
+```{r plot-cpi, fig.cap="Log CPI Trends: Emerging Importers vs Advanced Exporters"}
+avg_cpi <- data_processed %>%
+  group_by(date, group) %>%
+  summarise(mean_ln_cpi = mean(ln_cpi), .groups = "drop")
+
+ggplot(avg_cpi, aes(x = date, y = mean_ln_cpi, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = as.numeric(as.Date("2026-02-27")),
+             linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Emerging_Importer" = "#e74c3c",
+                                "Advanced_Exporter"  = "#2980b9"),
+                     labels = c("Emerging_Importer" = "Emerging Importers",
+                                "Advanced_Exporter"  = "Advanced Exporters")) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(title    = "Log CPI Trends by Country Group",
+       subtitle = "Group averages; dashed line = Gulf Crisis start (Feb 27, 2026)",
+       x = NULL, y = "Log(CPI)", color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+## IPI Trends by Country Group
+
+```{r plot-ipi, fig.cap="Log IPI Trends: Emerging Importers vs Advanced Exporters"}
+avg_ipi <- data_processed %>%
+  group_by(date, group) %>%
+  summarise(mean_ln_ipi = mean(ln_ipi), .groups = "drop")
+
+ggplot(avg_ipi, aes(x = date, y = mean_ln_ipi, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = as.numeric(as.Date("2026-02-27")),
+             linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Emerging_Importer" = "#e74c3c",
+                                "Advanced_Exporter"  = "#2980b9"),
+                     labels = c("Emerging_Importer" = "Emerging Importers",
+                                "Advanced_Exporter"  = "Advanced Exporters")) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(title    = "Log IPI Trends by Country Group",
+       subtitle = "Group averages; dashed line = Gulf Crisis start (Feb 27, 2026)",
+       x = NULL, y = "Log(IPI)", color = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+```
+
+---
+
+# ARIMA Forecasting — June 2026
+
+## Stationarity Tests
+
+```{r adf-tests}
+brent_ts <- oil_ts %>% pull(brent) %>% ts(frequency = 12)
+
+cat("=== ADF Test: Brent Oil Price (levels) ===\n")
+print(adf.test(brent_ts))
+
+cat("\n=== ADF Test: Brent Oil Price (1st difference) ===\n")
+print(adf.test(diff(brent_ts)))
+```
+
+## Brent Crude Forecast — June 2026
+
+```{r arima-brent, fig.cap="ARIMA Forecast: Brent Crude Oil Price for June 2026"}
+arima_brent <- auto.arima(brent_ts, seasonal = TRUE,
+                           stepwise = FALSE, approximation = FALSE,
+                           trace = FALSE)
+cat("Best ARIMA model for Brent:\n"); print(arima_brent)
+
+fc_brent <- forecast(arima_brent, h = 1)
+autoplot(fc_brent) +
+  labs(title    = "ARIMA Forecast: Brent Crude Oil — June 2026",
+       subtitle = paste0("Model: ARIMA(",
+                         paste(arima_brent$arma[c(1,6,2)], collapse = ","), ")"),
+       x = "Time (months since Jan 2023)", y = "USD / Barrel") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+cat(sprintf("\n-- June 2026 Brent Forecast --\n"))
+cat(sprintf("  Point forecast : $%.2f / barrel\n",  fc_brent$mean[1]))
+cat(sprintf("  80%% PI        : [$%.2f, $%.2f]\n",
+            fc_brent$lower[1,1], fc_brent$upper[1,1]))
+cat(sprintf("  95%% PI        : [$%.2f, $%.2f]\n",
+            fc_brent$lower[1,2], fc_brent$upper[1,2]))
+```
+
+## CPI Forecasts — All 8 Countries
+
+```{r arima-cpi-loop}
+countries_list <- sort(unique(data_processed$country))
+
+cpi_forecasts <- tibble(Country = character(), Model = character(),
+                        Forecast_CPI = numeric(), PI_80_Low = numeric(),
+                        PI_80_High = numeric(), PI_95_Low = numeric(),
+                        PI_95_High = numeric())
+
+for (ctry in countries_list) {
+  cpi_ts <- data_processed %>%
+    filter(country == ctry) %>% arrange(date) %>%
+    pull(ln_cpi) %>%
+    ts(frequency = 12, start = c(2023, 1))
+
+  fit <- auto.arima(cpi_ts, seasonal = TRUE,
+                    stepwise = FALSE, approximation = FALSE, trace = FALSE)
+  fc  <- forecast(fit, h = 1)
+
+  cpi_forecasts <- bind_rows(cpi_forecasts, tibble(
+    Country      = ctry,
+    Model        = paste0("ARIMA(", paste(fit$arma[c(1,6,2)], collapse = ","), ")"),
+    Forecast_CPI = round(exp(fc$mean[1]),    4),
+    PI_80_Low    = round(exp(fc$lower[1,1]), 4),
+    PI_80_High   = round(exp(fc$upper[1,1]), 4),
+    PI_95_Low    = round(exp(fc$lower[1,2]), 4),
+    PI_95_High   = round(exp(fc$upper[1,2]), 4)
+  ))
+}
+
+cpi_forecasts %>%
+  kbl(caption = "ARIMA Forecasted CPI Level — June 2026",
+      col.names = c("Country", "Model", "CPI Forecast",
+                    "80% Low", "80% High", "95% Low", "95% High"),
+      align = "lcrrrrr", booktabs = TRUE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(3, bold = TRUE, color = "#c0392b")
+```
+
+## IPI Forecasts — All 8 Countries
+
+```{r arima-ipi-loop}
+ipi_forecasts <- tibble(Country = character(), Model = character(),
+                        Forecast_IPI = numeric(), PI_80_Low = numeric(),
+                        PI_80_High = numeric(), PI_95_Low = numeric(),
+                        PI_95_High = numeric())
+
+for (ctry in countries_list) {
+  ipi_ts <- data_processed %>%
+    filter(country == ctry) %>% arrange(date) %>%
+    pull(ln_ipi) %>%
+    ts(frequency = 12, start = c(2023, 1))
+
+  fit <- auto.arima(ipi_ts, seasonal = TRUE,
+                    stepwise = FALSE, approximation = FALSE, trace = FALSE)
+  fc  <- forecast(fit, h = 1)
+
+  ipi_forecasts <- bind_rows(ipi_forecasts, tibble(
+    Country      = ctry,
+    Model        = paste0("ARIMA(", paste(fit$arma[c(1,6,2)], collapse = ","), ")"),
+    Forecast_IPI = round(exp(fc$mean[1]),    4),
+    PI_80_Low    = round(exp(fc$lower[1,1]), 4),
+    PI_80_High   = round(exp(fc$upper[1,1]), 4),
+    PI_95_Low    = round(exp(fc$lower[1,2]), 4),
+    PI_95_High   = round(exp(fc$upper[1,2]), 4)
+  ))
+}
+
+ipi_forecasts %>%
+  kbl(caption = "ARIMA Forecasted IPI Level — June 2026",
+      col.names = c("Country", "Model", "IPI Forecast",
+                    "80% Low", "80% High", "95% Low", "95% High"),
+      align = "lcrrrrr", booktabs = TRUE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(3, bold = TRUE, color = "#27ae60")
+```
+
+---
+
+# Panel Regression — Main Group: Emerging Importers
+
+## Declare Panel Frame
+
+```{r panel-emerging}
+pdata_emg <- data_processed %>%
+  filter(country %in% emerging_importers) %>%
+  pdata.frame(index = c("country", "date"))
+
+cat("Panel: Emerging Importers\n")
+cat("Countries :", pdim(pdata_emg)$nT$n, "\n")
+cat("Periods   :", pdim(pdata_emg)$nT$T, "\n")
+cat("Balanced  :", pdim(pdata_emg)$balanced, "\n")
+cat("Observations:", pdim(pdata_emg)$nT$n * pdim(pdata_emg)$nT$T, "\n")
+```
+
+## CPI Models — Emerging Importers
+
+```{r cpi-emg-models}
+formula_cpi <- ln_cpi ~ oil_pct_change + ln_neer +
+                        policy_rate + vix + post_crisis
+
+pols_cpi_emg <- plm(formula_cpi, data = pdata_emg, model = "pooling")
+fe_cpi_emg   <- plm(formula_cpi, data = pdata_emg, model = "within")
+re_cpi_emg   <- plm(formula_cpi, data = pdata_emg, model = "random")
+```
+
+```{r cpi-emg-table, results='asis'}
+
+stargazer(pols_cpi_emg, fe_cpi_emg, re_cpi_emg,
+          title          = "CPI Regression — Emerging Importers",
+          column.labels  = c("Pooled OLS", "Fixed Effects", "Random Effects"),
+          dep.var.labels = "ln(CPI)",
+          covariate.labels = c("Oil Shock (% $\\Delta$ Brent)",
+                               "ln(NEER)", "Policy Rate (%)",
+                               "VIX", "Post-Crisis Dummy"),
+          keep.stat      = c("n", "rsq", "adj.rsq"),
+          type           = "latex", style = "aer",
+          digits         = 6,
+          digits.extra   = 4,
+          notes          = "Arellano HC3 robust SE applied in Section 8.",
+          notes.align    = "l")
+```
+
+## IPI Models — Emerging Importers
+
+```{r ipi-emg-models}
+formula_ipi <- ln_ipi ~ oil_pct_change + ln_neer +
+                        policy_rate + vix + post_crisis
+
+pols_ipi_emg <- plm(formula_ipi, data = pdata_emg, model = "pooling")
+fe_ipi_emg   <- plm(formula_ipi, data = pdata_emg, model = "within")
+re_ipi_emg   <- plm(formula_ipi, data = pdata_emg, model = "random")
+```
+
+```{r ipi-emg-table, results='asis'}
+
+stargazer(pols_ipi_emg, fe_ipi_emg, re_ipi_emg,
+          title          = "IPI Regression — Emerging Importers",
+          column.labels  = c("Pooled OLS", "Fixed Effects", "Random Effects"),
+          dep.var.labels = "ln(IPI)",
+          covariate.labels = c("Oil Shock (% $\\Delta$ Brent)",
+                               "ln(NEER)", "Policy Rate (%)",
+                               "VIX", "Post-Crisis Dummy"),
+          keep.stat      = c("n", "rsq", "adj.rsq"),
+          type           = "latex", style = "aer",
+          digits         = 6,
+          digits.extra   = 4,
+          notes          = "Arellano HC3 robust SE applied in Section 8.",
+          notes.align    = "l")
+```
+
+---
+
+# Panel Regression — Comparison Group: Advanced Exporters
+
+## Declare Panel Frame
+
+```{r panel-advanced}
+pdata_adv <- data_processed %>%
+  filter(country %in% advanced_exporters) %>%
+  pdata.frame(index = c("country", "date"))
+
+cat("Panel: Advanced Exporters\n")
+cat("Countries :", pdim(pdata_adv)$nT$n, "\n")
+cat("Periods   :", pdim(pdata_adv)$nT$T, "\n")
+cat("Balanced  :", pdim(pdata_adv)$balanced, "\n")
+cat("Observations:", pdim(pdata_adv)$nT$n * pdim(pdata_adv)$nT$T, "\n")
+```
+
+## CPI Models — Advanced Exporters
+
+```{r cpi-adv-models}
+pols_cpi_adv <- plm(formula_cpi, data = pdata_adv, model = "pooling")
+fe_cpi_adv   <- plm(formula_cpi, data = pdata_adv, model = "within")
+re_cpi_adv <- plm(formula_cpi, data = pdata_adv, model = "random",
+                  random.method = "walhus")  # or "amemiya"
+```
+
+```{r cpi-adv-table, results='asis'}
+
+stargazer(pols_cpi_adv, fe_cpi_adv, re_cpi_adv,
+          title          = "CPI Regression — Advanced Exporters",
+          column.labels  = c("Pooled OLS", "Fixed Effects", "Random Effects"),
+          dep.var.labels = "ln(CPI)",
+          covariate.labels = c("Oil Shock (% $\\Delta$ Brent)",
+                               "ln(NEER)", "Policy Rate (%)",
+                               "VIX", "Post-Crisis Dummy"),
+          keep.stat      = c("n", "rsq", "adj.rsq"),
+          type           = "latex", style = "aer",
+          digits         = 6,
+          digits.extra   = 4,
+          notes          = "Arellano HC3 robust SE applied in Section 8.",
+          notes.align    = "l")
+```
+
+## IPI Models — Advanced Exporters
+
+```{r ipi-adv-models}
+pols_ipi_adv <- plm(formula_ipi, data = pdata_adv, model = "pooling")
+fe_ipi_adv   <- plm(formula_ipi, data = pdata_adv, model = "within")
+re_ipi_adv <- plm(formula_ipi, data = pdata_adv, model = "random",
+                  random.method = "walhus")  # or "amemiya"
+```
+
+```{r ipi-adv-table, results='asis'}
+
+stargazer(pols_ipi_adv, fe_ipi_adv, re_ipi_adv,
+          title          = "IPI Regression — Advanced Exporters",
+          column.labels  = c("Pooled OLS", "Fixed Effects", "Random Effects"),
+          dep.var.labels = "ln(IPI)",
+          covariate.labels = c("Oil Shock (% $\\Delta$ Brent)",
+                               "ln(NEER)", "Policy Rate (%)",
+                               "VIX", "Post-Crisis Dummy"),
+          keep.stat      = c("n", "rsq", "adj.rsq"),
+          type           = "latex", style = "aer",
+          digits         = 6,
+          digits.extra   = 4,
+          notes          = "Arellano HC3 robust SE applied in Section 8.",
+          notes.align    = "l")
+```
+
+
+---
+
+# Diagnostic Tests and Robust Standard Errors
+
+## Hausman Test (FE vs. RE)
+
+```{r hausman}
+# Emerging Importers
+haus_cpi_emg <- phtest(fe_cpi_emg, re_cpi_emg)
+haus_ipi_emg <- phtest(fe_ipi_emg, re_ipi_emg)
+
+cat("=== Hausman Test — CPI (Emerging Importers) ===\n")
+print(haus_cpi_emg)
+cat(if (haus_cpi_emg$p.value < 0.05)
+  "\n-> p < 0.05: Reject H0. Fixed Effects preferred.\n"
+  else
+  "\n-> p >= 0.05: Fail to reject H0. Random Effects acceptable.\n")
+
+cat("\n=== Hausman Test — IPI (Emerging Importers) ===\n")
+print(haus_ipi_emg)
+cat(if (haus_ipi_emg$p.value < 0.05)
+  "\n-> p < 0.05: Reject H0. Fixed Effects preferred.\n"
+  else
+  "\n-> p >= 0.05: Fail to reject H0. Random Effects acceptable.\n")
+
+# Advanced Exporters
+haus_cpi_adv <- phtest(fe_cpi_adv, re_cpi_adv)
+haus_ipi_adv <- phtest(fe_ipi_adv, re_ipi_adv)
+
+cat("\n=== Hausman Test — CPI (Advanced Exporters) ===\n")
+print(haus_cpi_adv)
+cat(if (haus_cpi_adv$p.value < 0.05)
+  "\n-> p < 0.05: Reject H0. Fixed Effects preferred.\n"
+  else
+  "\n-> p >= 0.05: Fail to reject H0. Random Effects acceptable.\n")
+
+cat("\n=== Hausman Test — IPI (Advanced Exporters) ===\n")
+print(haus_ipi_adv)
+cat(if (haus_ipi_adv$p.value < 0.05)
+  "\n-> p < 0.05: Reject H0. Fixed Effects preferred.\n"
+  else
+  "\n-> p >= 0.05: Fail to reject H0. Random Effects acceptable.\n")
+```
+
+## Breusch-Pagan LM Test (RE vs. POLS)
+
+```{r breusch-pagan}
+bp_cpi_emg <- plmtest(pols_cpi_emg, effect = "individual", type = "bp")
+bp_ipi_emg <- plmtest(pols_ipi_emg, effect = "individual", type = "bp")
+bp_cpi_adv <- plmtest(pols_cpi_adv, effect = "individual", type = "bp")
+bp_ipi_adv <- plmtest(pols_ipi_adv, effect = "individual", type = "bp")
+
+cat("=== BP Test — CPI (Emerging Importers) ===\n"); print(bp_cpi_emg)
+cat("\n=== BP Test — IPI (Emerging Importers) ===\n"); print(bp_ipi_emg)
+cat("\n=== BP Test — CPI (Advanced Exporters) ===\n"); print(bp_cpi_adv)
+cat("\n=== BP Test — IPI (Advanced Exporters) ===\n"); print(bp_ipi_adv)
+```
+
+## Robust Standard Errors
+
+```{r robust-se}
+cat("=== FE CPI — Emerging Importers | Arellano HC3 ===\n")
+coeftest(fe_cpi_emg, vcov = vcovHC(fe_cpi_emg, method = "arellano", type = "HC3"))
+
+cat("\n=== FE IPI — Emerging Importers | Arellano HC3 ===\n")
+coeftest(fe_ipi_emg, vcov = vcovHC(fe_ipi_emg, method = "arellano", type = "HC3"))
+
+cat("\n=== FE CPI — Advanced Exporters | Arellano HC3 ===\n")
+coeftest(fe_cpi_adv, vcov = vcovHC(fe_cpi_adv, method = "arellano", type = "HC3"))
+
+cat("\n=== FE IPI — Advanced Exporters | Arellano HC3 ===\n")
+coeftest(fe_ipi_adv, vcov = vcovHC(fe_ipi_adv, method = "arellano", type = "HC3"))
+```
+
+## Coefficient Comparison Plot
+
+```{r coef-plot, fig.cap="Oil Shock Coefficient on ln(CPI): Emerging Importers vs Advanced Exporters"}
+extract_coef <- function(model, label) {
+  ct  <- coeftest(model, vcov = vcovHC(model, method = "arellano", type = "HC3"))
+  est <- ct["oil_pct_change", "Estimate"]
+  se  <- ct["oil_pct_change", "Std. Error"]
+  data.frame(Group    = label,
+             Estimate = est,
+             CI_low   = est - 1.96 * se,
+             CI_high  = est + 1.96 * se)
+}
+
+coef_df <- rbind(
+  extract_coef(fe_cpi_emg, "Emerging Importers\n(Main Group)"),
+  extract_coef(fe_cpi_adv, "Advanced Exporters\n(Comparison Group)")
+)
+
+ggplot(coef_df, aes(x = Group, y = Estimate, color = Group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high),
+                width = 0.15, linewidth = 0.9) +
+  geom_point(size = 5) +
+  scale_color_manual(
+    values = c("Emerging Importers\n(Main Group)"      = "#e74c3c",
+               "Advanced Exporters\n(Comparison Group)" = "#2980b9")) +
+  labs(title    = "Oil Shock Coefficient on ln(CPI) by Country Group",
+       subtitle = "Fixed Effects model; bars = 95% CI (Arellano HC3)",
+       x = NULL, y = "Coefficient Estimate") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+---
+
+
